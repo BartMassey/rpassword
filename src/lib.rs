@@ -22,7 +22,7 @@ use std::io::ErrorKind as IoErrorKind;
 
 /// Sets all bytes of a String to 0
 fn zero_memory(s: &mut String) {
-    let mut vec = unsafe { s.as_mut_vec() };
+    let vec = unsafe { s.as_mut_vec() };
     for el in vec.iter_mut() {
         *el = 0u8;
     }
