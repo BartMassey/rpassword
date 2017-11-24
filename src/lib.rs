@@ -15,6 +15,10 @@
 #[cfg(unix)]
 extern crate libc;
 
+#[cfg(all(unix,test))]
+#[macro_use]
+extern crate ptyknot;
+
 use std::io::Write;
 use std::io::stdin;
 use std::io::Error as IoError;
@@ -59,6 +63,9 @@ pub fn read_password() -> ::std::io::Result<String> {
 #[cfg(unix)]
 mod unix {
     use libc::{c_int, isatty, tcgetattr, tcsetattr, TCSANOW, ECHO, ECHONL, STDIN_FILENO};
+    use std;
+    use std::io::{Write,BufReader};
+    use std::fs::OpenOptions;
 
     /// Turns a C function return into an IO Result
     fn io_result(ret: c_int) -> ::std::io::Result<()> {
@@ -135,6 +142,19 @@ mod unix {
 
         super::fixes_newline(password)
     }
+
+    /// (UNIX only) Prompts for a password on /dev/tty and
+    /// reads it from /dev/tty
+    pub fn prompt_password_tty(prompt: &str)
+                               -> std::io::Result<String> {
+        let mut tty =
+            OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+
+        write!(tty, "{}", prompt)?;
+        tty.flush()?;
+
+        read_password_with_reader(Some(BufReader::new(tty)))
+    }
 }
 
 #[cfg(windows)]
@@ -194,6 +214,8 @@ mod windows {
 
 #[cfg(unix)]
 pub use unix::read_password_with_reader;
+#[cfg(unix)]
+pub use unix::prompt_password_tty;
 #[cfg(windows)]
 pub use windows::read_password_with_reader;
 
