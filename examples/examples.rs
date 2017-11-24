@@ -20,11 +20,11 @@ fn main() {
         Ok(pass) => println!("{}", pass),
         Err(_) => println!("error")
     }
-    match rpassword::prompt_password_stdout("prompt_password_stdout") {
+    match rpassword::prompt_password_stdout("prompt_password_stdout: ") {
         Ok(pass) => println!("{}", pass),
         Err(_) => println!("error")
     }
-    match rpassword::prompt_password_stderr("prompt_password_stderr") {
+    match rpassword::prompt_password_stderr("prompt_password_stderr: ") {
         Ok(pass) => println!("{}", pass),
         Err(_) => println!("error")
     }
