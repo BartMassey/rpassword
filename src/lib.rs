@@ -20,7 +20,6 @@ extern crate libc;
 extern crate ptyknot;
 
 use std::io::Write;
-use std::io::stdin;
 use std::io::Error as IoError;
 use std::io::ErrorKind as IoErrorKind;
 
@@ -55,17 +54,32 @@ fn fixes_newline(mut password: String) -> std::io::Result<String> {
     Ok(password)
 }
 
+/// Places a password can be read from.
+pub enum PWSource {
+    /// Standard input. Will check if tty.
+    PWSourceStdin,
+    /// Some cursor. Not a tty.
+    PWSourceString(String),
+    /// Some file. Will check if tty.
+    PWSourceFile(std::fs::File)
+}
+use PWSource::*;
+
 /// Reads a password from STDIN
 pub fn read_password() -> ::std::io::Result<String> {
-    read_password_with_reader(None::<::std::io::Empty>)
+    read_password_with_reader(PWSourceStdin)
 }
 
 #[cfg(unix)]
 mod unix {
-    use libc::{c_int, isatty, tcgetattr, tcsetattr, TCSANOW, ECHO, ECHONL, STDIN_FILENO};
+    use libc::{c_int, isatty, tcgetattr, tcsetattr, TCSANOW, ECHO, ECHONL, STDIN_FILENO, EINVAL};
     use std;
-    use std::io::{Write,BufReader};
+    use std::io::{Write, BufRead, BufReader, Cursor};
     use std::fs::OpenOptions;
+    use std::os::unix::io::{RawFd, AsRawFd};
+    use super::PWSource;
+    use super::PWSource::*;
+    use super::IoError;
 
     /// Turns a C function return into an IO Result
     fn io_result(ret: c_int) -> ::std::io::Result<()> {
@@ -75,23 +89,52 @@ mod unix {
         }
     }
 
-    /// Reads a password from anything that implements BufRead
-    pub fn read_password_with_reader<T>(source: Option<T>) -> ::std::io::Result<String>
-        where T: ::std::io::BufRead {
+    /// Rust wrapper for isatty().
+    fn is_tty(fd: RawFd) -> ::std::io::Result<Option<RawFd>> {
+        match unsafe { isatty(fd) } {
+            1 => Ok(Some(fd)),
+            0 => {
+                let e = IoError::last_os_error();
+                if let Some(c) = e.raw_os_error() {
+                    if c == EINVAL as i32 {
+                        return Ok(None)
+                    }
+                };
+                Err(e)
+            },
+            _ => panic!("unexpected isatty() return")
+        }
+    }
+
+    /// Reads a password from anything that implements BufRead.
+    pub fn read_password_with_reader(source: PWSource) -> ::std::io::Result<String> {
         let mut password = String::new();
 
-        let input_is_tty = unsafe { isatty(0) } == 1;
+        let mut buf_reader: Box<BufRead> = match source {
+            PWSourceStdin => Box::new(BufReader::new(::std::io::stdin())),
+            PWSourceString(ref string) => Box::new(Cursor::new(string.as_bytes().clone())),
+            PWSourceFile(ref file) => Box::new(BufReader::new(file)),
+        };
 
-        // When we ask for a password in a terminal, we'll want to hide the password as it is
-        // typed by the user
-        if input_is_tty {
-            // Make two copies of the terminal settings. The first one will be modified
-            // and the second one will act as a backup for when we want to set the
-            // terminal back to its original state.
+        let tty_fd = match source {
+            PWSourceStdin => is_tty(STDIN_FILENO)?,
+            PWSourceString(_) => None,
+            PWSourceFile(ref file) => is_tty(file.as_raw_fd())?
+        };
+
+        // When we ask for a password in a terminal, we'll
+        // want to hide the password as it is typed by the
+        // user
+        if let Some(source_fd) = tty_fd {
+            // Make two copies of the terminal settings. The
+            // first one will be modified and the second one
+            // will act as a backup for when we want to set
+            // the terminal back to its original state.
             let mut term = unsafe { ::std::mem::uninitialized() };
             let mut term_orig = unsafe { ::std::mem::uninitialized() };
-            io_result(unsafe { tcgetattr(STDIN_FILENO, &mut term) })?;
-            io_result(unsafe { tcgetattr(STDIN_FILENO, &mut term_orig) })?;
+            io_result(unsafe { tcgetattr(source_fd, &mut term) })?;
+            io_result(unsafe { tcgetattr(source_fd, &mut term_orig) })?;
+
 
             // Hide the password. This is what makes this function useful.
             term.c_lflag &= !ECHO;
@@ -100,38 +143,32 @@ mod unix {
             term.c_lflag |= ECHONL;
 
             // Save the settings for now.
-            io_result(unsafe { tcsetattr(STDIN_FILENO, TCSANOW, &term) })?;
+            io_result(unsafe { tcsetattr(source_fd, TCSANOW, &term) })?;
 
             // Read the password.
-            let input = match source {
-                Some(mut reader) => reader.read_line(&mut password),
-                _ => ::std::io::stdin().read_line(&mut password),
-            };
+            let input = buf_reader.read_line(&mut password);
 
-            // Check the response.
-            match input {
+            // Reset the terminal.
+            match io_result(unsafe { tcsetattr(source_fd, TCSANOW, &term_orig) }) {
                 Ok(_) => {}
                 Err(err) => {
-                    // Reset the terminal and quit.
-                    io_result(unsafe { tcsetattr(STDIN_FILENO, TCSANOW, &term_orig) })?;
-
                     super::zero_memory(&mut password);
                     return Err(err);
                 }
             };
 
-            // Reset the terminal.
-            match io_result(unsafe { tcsetattr(STDIN_FILENO, TCSANOW, &term_orig) }) {
+            match input {
                 Ok(_) => {}
                 Err(err) => {
                     super::zero_memory(&mut password);
                     return Err(err);
                 }
             }
+
         } else {
             // If we don't have a TTY, the input was piped so we bypass
             // terminal hiding code
-            match super::stdin().read_line(&mut password) {
+            match buf_reader.read_line(&mut password) {
                 Ok(_) => {}
                 Err(err) => {
                     super::zero_memory(&mut password);
@@ -139,6 +176,9 @@ mod unix {
                 }
             }
         }
+
+        // XXX Hold the tty open until done with it.
+        drop(tty_fd);
 
         super::fixes_newline(password)
     }
@@ -153,7 +193,7 @@ mod unix {
         write!(tty, "{}", prompt)?;
         tty.flush()?;
 
-        read_password_with_reader(Some(BufReader::new(tty)))
+        read_password_with_reader(PWSourceFile(tty))
     }
 }
 
@@ -163,8 +203,7 @@ mod windows {
     extern crate kernel32;
 
     /// Reads a password from anything that implements BufRead
-    pub fn read_password_with_reader<T>(source: Option<T>) -> ::std::io::Result<String>
-        where T: ::std::io::BufRead {
+    pub fn read_password_with_reader(source: PWSource) -> ::std::io::Result<String> {
         let mut password = String::new();
 
         // Get the stdin handle
@@ -187,8 +226,11 @@ mod windows {
 
         // Read the password.
         let input = match source {
-            Some(mut reader) => reader.read_line(&mut password),
-            _ => ::std::io::stdin().read_line(&mut password),
+            PWSourceStdin => ::std::io::stdin().read_line(&mut password),
+            PWSourceString(string) => Cursor::new(string.as_bytes()).read_line(&mut password),
+            PWSourceFile(_) =>
+                return ::std::io::Err(::std::io::ErrorKind::InvalidData,
+                                      "reading password from file not supported in windows")
         };
 
         // Check the response.
@@ -238,22 +280,75 @@ pub fn prompt_password_stderr(prompt: &str) -> std::io::Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io::Cursor;
-
-    fn mock_input_crlf() -> Cursor<&'static [u8]> {
-        Cursor::new(&b"A mocked response.\r\n"[..])
-    }
-
-    fn mock_input_lf() -> Cursor<&'static [u8]> {
-        Cursor::new(&b"A mocked response.\n"[..])
-    }
+mod tests_all {
+    use super::PWSource::*;
 
     #[test]
     fn can_read_from_redirected_input() {
-        let response = ::read_password_with_reader(Some(mock_input_crlf())).unwrap();
+        let mock_input_crlf = "A mocked response.\r\n".to_string();
+        let mock_input_lf = "A mocked response.\n".to_string();
+
+        let response = ::read_password_with_reader(PWSourceString(mock_input_crlf)).expect("failed to read password with crlf");
         assert_eq!(response, "A mocked response.");
-        let response = ::read_password_with_reader(Some(mock_input_lf())).unwrap();
+        let response = ::read_password_with_reader(PWSourceString(mock_input_lf)).expect("failed to read password with lf");;
         assert_eq!(response, "A mocked response.");
+    }
+}
+
+#[cfg(all(unix,test))]
+mod tests_unix {
+    use std::io::{Write, Read, BufRead, BufReader, BufWriter};
+    use std::fs::File;
+    use std::os::unix::io::FromRawFd;
+
+    #[test]
+    fn can_use_tty() {
+        const PROMPT: &str = "? ";
+        const RESPONSE: &str = "secret";
+
+        fn slave() {
+            let pw = ::prompt_password_tty(PROMPT)
+                .expect("cannot get password from /dev/tty");
+            let outfile = unsafe{File::from_raw_fd(6)};
+            let mut outbuf = BufWriter::new(outfile);
+            writeln!(outbuf, "{}", pw)
+                .expect("cannot write secret to fd");
+            outbuf.flush().expect("cannot flush secret fd");
+        }
+
+        // XXX Have to read from weird fd because test
+        // runner is super-aggressive about grabbing
+        // stdout/stderr.
+        ptyknot!(knot, slave, @ pty, < slave_stderr 6);
+
+        // Get the prompt.
+        let mut received_prompt = PROMPT.as_bytes().to_vec();
+        let nread = pty.read(&mut received_prompt)
+                       .expect("cannot read prompt from pty");
+        assert!(nread == PROMPT.len());
+        assert!(received_prompt == PROMPT.as_bytes());
+
+        // Send the response.
+        let mut sent_response = RESPONSE.as_bytes().to_vec();
+        sent_response.push(b'\n');
+        pty.write(&sent_response).expect("cannot write pty");
+        pty.flush().expect("cannot flush pty");
+
+        // Get the secret.
+        let mut read_response = String::new();
+        BufReader::new(slave_stderr)
+            .read_line(&mut read_response).expect("cannot read secret");
+        let expected_response = format!("{}\n", RESPONSE);
+        assert!(read_response == expected_response);
+
+        // Get the newline.
+        let mut received_nl = vec![b'\n'];
+        let nread = pty.read(&mut received_nl.as_mut_slice())
+                       .expect("cannot read nl from pty");
+        assert!(nread == 1);
+        assert!(received_nl[0] == b'\r');
+
+        // This will wait for the child.
+        drop(knot);
     }
 }
